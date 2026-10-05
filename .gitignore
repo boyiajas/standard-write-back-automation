@@ -1,0 +1,22 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+downloads_sbsa/
+output_sbsa/
+notes.json
+.DS_Store
+*.log
+
+# Local research and unrelated automation utilities
+AGENTS.md
+LegalSuite_Field_Source_Checklist.csv
+LegalSuite_Field_Source_Gaps.md
+LegalSuite_Missing_Field_Sources.csv
+LegalSuite_Missing_Field_Sources.md
+absa_home_loan_extrascreen_update.py
+export_no_matter_found_reports.py
+ftp_download_today.py
