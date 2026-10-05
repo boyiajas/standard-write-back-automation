@@ -891,6 +891,55 @@ def send_ftp_upload_summary_email(source: HandoverSource, counts: dict[str, int]
     return False
 
 
+def send_failure_notification(error_message: str, run_context: str) -> bool:
+    """Notify the helpdesk when a write-back run fails before completion."""
+    smtp_host = os.getenv("MAIL_HOST", os.getenv("SMTP_HOST", "")).strip()
+    smtp_port = int(os.getenv("MAIL_PORT", os.getenv("SMTP_PORT", "587")).strip() or "587")
+    smtp_user = os.getenv("MAIL_USERNAME", os.getenv("SMTP_USER", "")).strip()
+    smtp_pass = os.getenv("MAIL_PASSWORD", os.getenv("SMTP_PASS", "")).strip()
+    smtp_from = os.getenv("MAIL_FROM_ADDRESS", os.getenv("SMTP_FROM", smtp_user)).strip()
+    auth_mode = os.getenv("MAIL_AUTH_MODE", os.getenv("SMTP_AUTH_MODE", "login")).strip().lower()
+    use_auth = auth_mode not in {"none", "noauth", "false", "0", "no"}
+    encryption = os.getenv("MAIL_ENCRYPTION", "").strip().lower()
+    use_tls = encryption not in {"", "null", "none", "false", "0", "no"} if "MAIL_ENCRYPTION" in os.environ else (
+        os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+    )
+    if not smtp_host or not smtp_from:
+        print("Failure notification skipped: MAIL_HOST and MAIL_FROM_ADDRESS are required", file=sys.stderr)
+        return False
+
+    failed_at = dt.datetime.now(ZoneInfo("Africa/Johannesburg"))
+    message = EmailMessage()
+    message["Subject"] = f"FAILED: Standard Bank write-back -- {failed_at.strftime('%Y/%m/%d %H:%M:%S')}"
+    message["From"] = smtp_from
+    message["To"] = ", ".join(WRITE_BACK_REPORT_TO)
+    message.set_content(
+        "Good Day,\n\n"
+        "The Standard Bank LegalSuite write-back run failed and no completion state was recorded.\n\n"
+        f"Run context: {run_context}\n"
+        f"Failed at: {failed_at.isoformat()}\n"
+        f"Error: {error_message}\n\n"
+        "Please investigate the service connection and retry the run.\n\n"
+        "Kind Regards,\n"
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+                if use_tls:
+                    server.starttls()
+                if use_auth and smtp_user:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(message, from_addr=smtp_from, to_addrs=WRITE_BACK_REPORT_TO)
+            print("Failure notification email sent", file=sys.stderr)
+            return True
+        except (OSError, smtplib.SMTPException) as exc:
+            last_error = exc
+            print(f"Failure notification attempt {attempt}/3 failed: {exc}", file=sys.stderr)
+    print(f"Failure notification email failed: {last_error}", file=sys.stderr)
+    return False
+
+
 def process_handover_source(source: HandoverSource, path: Path, api_key: str,
                             stage_codes: set[str], mappings: dict[str, dict]) -> tuple[dict[str, list[dict[str, object]]], dict[str, int]]:
     accounts = read_handover_accounts(path)
@@ -1153,6 +1202,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (OSError, ValueError, RuntimeError, ftplib.Error, EOFError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        context = f"matter_id={args.matter_id}" if args.matter_id else "handover batch"
+        send_failure_notification(str(exc), context)
         return 1
 
 
