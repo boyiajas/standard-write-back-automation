@@ -11,6 +11,7 @@ import csv
 import datetime as dt
 import ftplib
 import hashlib
+import io
 import json
 import os
 import re
@@ -828,6 +829,42 @@ def upload_csv_to_ftp(ftp: ftplib.FTP, local_path: Path,
     return remote_path
 
 
+def _latest_uploaded_stage_rows(ftp: ftplib.FTP, mt_id: str) -> tuple[list[str], set[tuple[str, ...]]] | None:
+    """Download and parse the newest completed CSV previously uploaded for an MT ID."""
+    stage_folder = mt_id.removeprefix("MT")
+    remote_dir = f"{FTP_WRITE_BACK_DIR.rstrip('/')}/{stage_folder}"
+    filenames = sorted(
+        name for name in _ftp_names(ftp, remote_dir)
+        if name.lower().endswith(".csv") and not name.endswith(".uploading")
+    )
+    if not filenames:
+        return None
+    payload = bytearray()
+    ftp.retrbinary(f"RETR {remote_dir}/{filenames[-1]}", payload.extend)
+    reader = csv.reader(io.StringIO(payload.decode("utf-8-sig", errors="strict")))
+    try:
+        headers = next(reader)
+    except StopIteration:
+        return ([], set())
+    return headers, {tuple(row) for row in reader}
+
+
+def _has_new_stage_rows(ftp: ftplib.FTP, mt_id: str, rows: list[dict[str, object]],
+                        headers: list[str]) -> bool:
+    """Return true only when the current stage contains rows absent from the latest FTP CSV."""
+    snapshot = _latest_uploaded_stage_rows(ftp, mt_id)
+    if snapshot is None:
+        return True
+    previous_headers, previous_rows = snapshot
+    if previous_headers != headers:
+        return True
+    current_rows = {
+        tuple(str(_safe_csv_value(row.get(header, "")) or "") for header in headers)
+        for row in rows
+    }
+    return bool(current_rows - previous_rows)
+
+
 def send_ftp_upload_summary_email(source: HandoverSource, counts: dict[str, int],
                                   uploads: list[dict[str, object]],
                                   completed_at: dt.datetime) -> bool:
@@ -1085,8 +1122,19 @@ def run_handover_batch(args: argparse.Namespace, api_key: str, stage_codes: set[
             csv_paths: list[str] = []
             generated_files: list[tuple[str, Path, int]] = []
             for mt_id, rows in sorted(rows_by_stage.items()):
+                headers = _stage_headers(mt_id, mappings)
+                if source.local_path is None:
+                    if ftp is None:
+                        raise RuntimeError("FTP connection is unavailable for stage comparison")
+                    try:
+                        has_new_rows = _has_new_stage_rows(ftp, mt_id, rows, headers)
+                    except (OSError, EOFError, UnicodeError, csv.Error) as exc:
+                        raise RuntimeError(f"Could not compare previous FTP CSV for {mt_id}: {exc}") from exc
+                    if not has_new_rows:
+                        print(f"No new file notes for {mt_id}; latest FTP CSV retained")
+                        continue
                 csv_path = csv_dir / timestamped_csv_name(mt_id, mappings, generated_at)
-                write_csv(csv_path, rows, _stage_headers(mt_id, mappings))
+                write_csv(csv_path, rows, headers)
                 csv_paths.append(str(csv_path.resolve()))
                 generated_files.append((mt_id, csv_path, len(rows)))
                 print(f"CSV: {csv_path} | stage={mt_id} rows={len(rows)}")

@@ -487,6 +487,17 @@ class HandoverBatchTests(unittest.TestCase):
             self.assertIsNone(write_back.fetch_debtor_party("600001", "test-key"))
         fetch_records.assert_called_once()
 
+    def test_stage_comparison_only_allows_new_rows(self) -> None:
+        headers = ["messageID", "Acccount Number"]
+        rows = [{"messageID": "300", "Acccount Number": "000123"}]
+        with patch.object(write_back, "_latest_uploaded_stage_rows",
+                          return_value=(headers, {("300", "000123")})):
+            self.assertFalse(write_back._has_new_stage_rows(object(), "MT300", rows, headers))
+        with patch.object(write_back, "_latest_uploaded_stage_rows",
+                          return_value=(headers, {("300", "000123")})):
+            rows.append({"messageID": "300", "Acccount Number": "000456"})
+            self.assertTrue(write_back._has_new_stage_rows(object(), "MT300", rows, headers))
+
     def test_missing_matter_is_retried_on_next_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
