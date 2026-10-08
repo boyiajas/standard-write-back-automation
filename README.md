@@ -2,6 +2,8 @@
 
 `standard_bank_write_back.py` reads LegalSuite and the Standard Bank FTP server, creates per-stage CSV files, uploads production batch files to FTP, and emails a completion summary to the helpdesk. It does not update LegalSuite.
 
+See [OPERATIONS.md](OPERATIONS.md) for the complete workflow, configuration reference, manual commands, FTP duplicate-check behavior, troubleshooting guidance, and cron deployment example.
+
 ## Server deployment
 
 The automation uses only the Python 3 standard library and requires Python 3.9 or newer. Clone the repository, create the private runtime configuration from the committed template, and lock down its permissions:
