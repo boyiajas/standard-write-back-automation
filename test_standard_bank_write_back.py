@@ -292,7 +292,8 @@ class HandoverBatchTests(unittest.TestCase):
             "ftp:source.xlsx", "source.xlsx", dt.date(2026, 9, 30), "panel_l"
         )
         counts = {"accounts": 2, "new_matters": 2, "file_notes": 3,
-                  "excluded": 0, "not_new": 0, "pending": 0}
+                  "excluded": 0, "not_new": 0, "pending": 0,
+                  "stages_compared": 4, "stages_new": 1, "stages_skipped": 3}
         uploads = [{"mt_id": "MT303", "rows": 3,
                     "remote_path": "/LSW TO APT/SBSA Panel Write Back Data/303/file.csv"}]
         environment = {
@@ -313,6 +314,10 @@ class HandoverBatchTests(unittest.TestCase):
 
         self.assertEqual(sent[0][2], ("helpdesk@iconis.co.za", "dev@iconis.co.za"))
         self.assertIn("SBSA Panel Write Back Data/303/file.csv", sent[0][0].get_content())
+        self.assertIn("1. Found 3 file notes", sent[0][0].get_content())
+        self.assertIn("2. MT IDs compared against latest FTP CSV: 4", sent[0][0].get_content())
+        self.assertIn("5. Duplicate CSVs generated or uploaded: No",
+                      sent[0][0].get_content())
 
     def test_stage_headers_include_only_mapped_fields_and_disambiguate_duplicates(self) -> None:
         mappings, _ = write_back.load_message_mappings(write_back.DEFAULT_MAPPINGS_FILE)

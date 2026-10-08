@@ -894,6 +894,7 @@ def send_ftp_upload_summary_email(source: HandoverSource, counts: dict[str, int]
         f"- {item['mt_id']}: {item['rows']} row(s) -> {item['remote_path']}"
         for item in uploads
     ] or ["- No stage CSVs were generated."]
+    duplicate_status = "No" if source.local_path is None else "Not applicable (local run)"
     message.set_content(
         "Good Day,\n\n"
         "The Standard Bank LegalSuite write-back CSV upload has completed.\n\n"
@@ -903,6 +904,12 @@ def send_ftp_upload_summary_email(source: HandoverSource, counts: dict[str, int]
         f"Accounts: {counts['accounts']}\n"
         f"New matters: {counts['new_matters']}\n"
         f"File notes exported: {counts['file_notes']}\n"
+        "Daily comparison summary:\n"
+        f"1. Found {counts['file_notes']} file notes\n"
+        f"2. MT IDs compared against latest FTP CSV: {counts.get('stages_compared', 0)}\n"
+        f"3. New/changed MT IDs: {counts.get('stages_new', 0)}\n"
+        f"4. MT IDs with no new file notes: {counts.get('stages_skipped', 0)}\n"
+        f"5. Duplicate CSVs generated or uploaded: {duplicate_status}\n\n"
         f"Stage files uploaded: {len(uploads)}\n"
         f"Excluded accounts: {counts['excluded']}\n"
         f"Not-new accounts: {counts['not_new']}\n"
@@ -1118,6 +1125,7 @@ def run_handover_batch(args: argparse.Namespace, api_key: str, stage_codes: set[
                 skipped += 1
                 continue
             rows_by_stage, counts = process_handover_source(source, local_path, api_key, stage_codes, mappings)
+            counts.update(stages_compared=0, stages_skipped=0, stages_new=0)
             generated_at = dt.datetime.now(ZoneInfo("Africa/Johannesburg"))
             csv_paths: list[str] = []
             generated_files: list[tuple[str, Path, int]] = []
@@ -1130,9 +1138,12 @@ def run_handover_batch(args: argparse.Namespace, api_key: str, stage_codes: set[
                         has_new_rows = _has_new_stage_rows(ftp, mt_id, rows, headers)
                     except (OSError, EOFError, UnicodeError, csv.Error) as exc:
                         raise RuntimeError(f"Could not compare previous FTP CSV for {mt_id}: {exc}") from exc
+                    counts["stages_compared"] += 1
                     if not has_new_rows:
+                        counts["stages_skipped"] += 1
                         print(f"No new file notes for {mt_id}; latest FTP CSV retained")
                         continue
+                counts["stages_new"] += 1
                 csv_path = csv_dir / timestamped_csv_name(mt_id, mappings, generated_at)
                 write_csv(csv_path, rows, headers)
                 csv_paths.append(str(csv_path.resolve()))
@@ -1141,17 +1152,18 @@ def run_handover_batch(args: argparse.Namespace, api_key: str, stage_codes: set[
 
             uploads: list[dict[str, object]] = []
             notification_sent = False
-            if source.local_path is None and generated_files:
+            if source.local_path is None:
                 if ftp is None:
-                    raise RuntimeError("FTP connection is unavailable for write-back upload")
-                try:
-                    ftp.voidcmd("NOOP")
-                except ftplib.all_errors:
+                    raise RuntimeError("FTP connection is unavailable for write-back upload/notification")
+                if generated_files:
                     try:
-                        ftp.close()
+                        ftp.voidcmd("NOOP")
                     except ftplib.all_errors:
-                        pass
-                    ftp = connect_ftp(args.ftp_timeout)
+                        try:
+                            ftp.close()
+                        except ftplib.all_errors:
+                            pass
+                        ftp = connect_ftp(args.ftp_timeout)
                 for mt_id, csv_path, row_count in generated_files:
                     remote_path = upload_csv_to_ftp(ftp, csv_path, FTP_WRITE_BACK_DIR, mt_id)
                     uploads.append({"mt_id": mt_id, "rows": row_count, "remote_path": remote_path})
@@ -1160,7 +1172,7 @@ def run_handover_batch(args: argparse.Namespace, api_key: str, stage_codes: set[
                     source, counts, uploads, dt.datetime.now(ZoneInfo("Africa/Johannesburg"))
                 )
                 if not notification_sent:
-                    raise RuntimeError("CSV files uploaded, but the helpdesk summary email could not be sent")
+                    raise RuntimeError("Write-back completed, but the helpdesk summary email could not be sent")
             complete = counts["pending"] == 0
             state[source.identity] = {
                 "source_sha256": source_hash,
