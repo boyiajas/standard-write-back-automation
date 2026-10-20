@@ -69,12 +69,12 @@ The SMTP sender must be authorized to relay to those recipients. A Mimecast `451
 7. Register the matter by storing its LegalSuite MatterID, FileRef, account reference, handover source, and physical city.
 8. Retrieve matching file notes and exclude each numeric `FileNote.RecordID` already in the sent ledger.
 9. Enrich the remaining rows using the confirmed LegalSuite field sources and mapping workbook, then group them by MT stage code.
-10. If every registered matter has no unseen note, create no CSV, upload nothing, and send no completion email.
+10. If every registered matter has no unseen note, create no CSV and upload nothing, then send a daily no-upload notification.
 11. Otherwise generate one timestamped CSV per stage and upload it atomically through a temporary `.uploading` filename.
 12. Send the completion summary after uploads, then commit the delivered note IDs to state.
 13. Save each state transition locally and as an atomic timestamped FTP snapshot. Retain the newest 100 snapshots.
 
-The numeric LegalSuite file-note RecordID prevents the same note from being uploaded repeatedly. Existing note edits are not treated as new notes. If the local state is missing, the newest valid FTP snapshot is restored before handover discovery. If upload or email delivery is interrupted, the pending batch stays in state and is completed before the next discovery pass. Pending snapshots contain the CSV headers and rows needed to rebuild a missing local pending file after box loss.
+The numeric LegalSuite file-note RecordID prevents the same note from being uploaded repeatedly. Existing note edits are not treated as new notes. A daily run always reports its result by email: either the uploaded file summary or a no-upload notification. If the local state is missing, the newest valid FTP snapshot is restored before handover discovery. If upload or email delivery is interrupted, the pending batch stays in state and is completed before the next discovery pass. Pending snapshots contain the CSV headers and rows needed to rebuild a missing local pending file after box loss.
 
 ## CSV format and naming
 

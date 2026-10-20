@@ -890,7 +890,7 @@ def _has_new_stage_rows(ftp: ftplib.FTP, mt_id: str, rows: list[dict[str, object
 def send_ftp_upload_summary_email(source: HandoverSource, counts: dict[str, int],
                                   uploads: list[dict[str, object]],
                                   completed_at: dt.datetime) -> bool:
-    """Email the helpdesk only after every CSV for one handover has uploaded."""
+    """Email the daily result after uploads, or report that no upload was needed."""
     smtp_host = os.getenv("MAIL_HOST", os.getenv("SMTP_HOST", "")).strip()
     smtp_port = int(os.getenv("MAIL_PORT", os.getenv("SMTP_PORT", "587")).strip() or "587")
     smtp_user = os.getenv("MAIL_USERNAME", os.getenv("SMTP_USER", "")).strip()
@@ -909,7 +909,10 @@ def send_ftp_upload_summary_email(source: HandoverSource, counts: dict[str, int]
 
     recipients = WRITE_BACK_REPORT_TO
     message = EmailMessage()
-    message["Subject"] = f"Standard Bank write-back FTP upload summary -- {completed_at.strftime('%Y/%m/%d %H:%M:%S')}"
+    result_label = "FTP upload summary" if uploads else "no-upload notification"
+    message["Subject"] = (
+        f"Standard Bank write-back {result_label} -- {completed_at.strftime('%Y/%m/%d %H:%M:%S')}"
+    )
     message["From"] = smtp_from
     message["To"] = ", ".join(recipients)
     upload_lines = [
@@ -917,9 +920,15 @@ def send_ftp_upload_summary_email(source: HandoverSource, counts: dict[str, int]
         for item in uploads
     ] or ["- No stage CSVs were generated."]
     duplicate_status = "No" if source.local_path is None else "Not applicable (local run)"
+    result_text = (
+        "The Standard Bank LegalSuite write-back CSV upload has completed."
+        if uploads else
+        "The Standard Bank LegalSuite daily check completed. No new file notes were found, "
+        "so no CSV was generated or uploaded."
+    )
     message.set_content(
         "Good Day,\n\n"
-        "The Standard Bank LegalSuite write-back CSV upload has completed.\n\n"
+        f"{result_text}\n\n"
         f"Source handover: {source.filename}\n"
         f"Handover date: {source.handover_date.isoformat()}\n"
         f"Completed at: {completed_at.isoformat()}\n"
@@ -1338,10 +1347,7 @@ def _finish_pending_batch(ftp: ftplib.FTP, state: dict, state_path: Path) -> Non
             "rows": item.get("row_count", item.get("rows", 0)),
             "remote_path": remote_path,
         })
-    source = HandoverSource(
-        "daily-monitor", f"Handovers_from_{HANDOVER_MONITOR_START.strftime('%Y%m%d')}",
-        HANDOVER_MONITOR_START, "daily"
-    )
+    source = _daily_monitor_source()
     if not send_ftp_upload_summary_email(
         source, batch["counts"], uploads, dt.datetime.now(ZoneInfo("Africa/Johannesburg"))
     ):
@@ -1354,6 +1360,13 @@ def _finish_pending_batch(ftp: ftplib.FTP, state: dict, state_path: Path) -> Non
     state["last_successful_run"] = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).isoformat()
     state["pending_batch"] = None
     _save_note_state(state_path, state, ftp)
+
+
+def _daily_monitor_source() -> HandoverSource:
+    return HandoverSource(
+        "daily-monitor", f"Handovers_from_{HANDOVER_MONITOR_START.strftime('%Y%m%d')}",
+        HANDOVER_MONITOR_START, "daily",
+    )
 
 
 def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
@@ -1392,9 +1405,15 @@ def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
         })
         state["last_checked_at"] = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).isoformat()
         if not rows_by_stage:
+            notification_at = dt.datetime.now(ZoneInfo("Africa/Johannesburg"))
+            if not send_ftp_upload_summary_email(
+                _daily_monitor_source(), counts, [], notification_at
+            ):
+                raise RuntimeError("No-upload status email could not be sent")
+            state["last_no_upload_notification_at"] = notification_at.isoformat()
             _save_note_state(state_path, state, ftp)
             print(
-                f"No new file notes; no CSV generated, no FTP upload, and no email sent | "
+                f"No new file notes; no CSV generated or uploaded; status email sent | "
                 f"handover_files={discovery['handover_files']} registered_matters={len(state['matters'])}"
             )
             return 0

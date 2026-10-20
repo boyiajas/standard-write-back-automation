@@ -319,6 +319,19 @@ class HandoverBatchTests(unittest.TestCase):
         self.assertIn("5. Duplicate CSVs generated or uploaded: No",
                       sent[0][0].get_content())
 
+        no_upload_counts = {**counts, "file_notes": 0, "stages_new": 0}
+        with (
+            patch.dict(os.environ, environment, clear=False),
+            patch.object(write_back.smtplib, "SMTP", FakeSMTP),
+        ):
+            self.assertTrue(write_back.send_ftp_upload_summary_email(
+                source, no_upload_counts, [],
+                dt.datetime(2026, 10, 2, 6, 0, tzinfo=dt.timezone.utc),
+            ))
+        self.assertIn("no-upload notification", sent[1][0]["Subject"])
+        self.assertIn("No new file notes were found", sent[1][0].get_content())
+        self.assertIn("no CSV was generated or uploaded", sent[1][0].get_content())
+
     def test_stage_headers_include_only_mapped_fields_and_disambiguate_duplicates(self) -> None:
         mappings, _ = write_back.load_message_mappings(write_back.DEFAULT_MAPPINGS_FILE)
         self.assertEqual(write_back._stage_headers("MT300", mappings),
@@ -632,7 +645,7 @@ class IncrementalFileNoteTests(unittest.TestCase):
             self.assertEqual(restored, state)
             self.assertEqual(json.loads(local_path.read_text(encoding="utf-8")), state)
 
-    def test_no_unseen_notes_creates_no_csv_upload_or_email(self) -> None:
+    def test_no_unseen_notes_sends_status_without_csv_or_upload(self) -> None:
         class FakeFTP:
             def quit(self):
                 return None
@@ -665,7 +678,7 @@ class IncrementalFileNoteTests(unittest.TestCase):
                 ),
                 patch.object(write_back, "write_csv") as write_csv,
                 patch.object(write_back, "upload_csv_to_ftp") as upload,
-                patch.object(write_back, "send_ftp_upload_summary_email") as email,
+                patch.object(write_back, "send_ftp_upload_summary_email", return_value=True) as email,
                 redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(
@@ -673,7 +686,8 @@ class IncrementalFileNoteTests(unittest.TestCase):
                 )
             write_csv.assert_not_called()
             upload.assert_not_called()
-            email.assert_not_called()
+            email.assert_called_once()
+            self.assertEqual(email.call_args.args[2], [])
             self.assertTrue((args.csv_dir / write_back.NOTE_STATE_FILENAME).is_file())
 
     def test_pending_delivery_commits_note_ids_after_upload_and_email(self) -> None:
