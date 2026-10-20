@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Export file notes for newly created Standard Bank handover matters.
+"""Export new file notes for Standard Bank matters handed over since 6 October 2026.
 
-With no MatterID, scan previous-month FTP handovers and write CSVs. An explicit
-MatterID runs the original JSON lookup. The script reads LegalSuite only;
-fields without a confirmed source remain empty.
+With no MatterID or local handover option, scan FTP handovers from the monitoring
+start date and export only FileNote RecordIDs that have not been delivered. An
+explicit MatterID runs the original JSON lookup. The script reads LegalSuite
+only; fields without a confirmed source remain empty.
 """
 
 import argparse
@@ -34,7 +35,9 @@ DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / "SBSA Panel L LegalSuite
 DEFAULT_MAPPINGS_FILE = Path(__file__).resolve().parent / "SD-E4 Message ID Mappings.xlsx"
 DEFAULT_DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads_sbsa"
 DEFAULT_CSV_DIR = Path(__file__).resolve().parent / "output_sbsa"
-EXPORT_FORMAT_VERSION = 12
+EXPORT_FORMAT_VERSION = 13
+HANDOVER_MONITOR_START = dt.date(2026, 10, 6)
+NOTE_STATE_FILENAME = "write_back_note_state.json"
 FTP_WRITE_BACK_DIR = "/LSW TO APT/SBSA Panel Write Back Data"
 WRITE_BACK_REPORT_TO = (
     "helpdesk@iconis.co.za",
@@ -654,6 +657,22 @@ def discover_ftp_handover_sources(ftp: ftplib.FTP, year: int, month: int) -> lis
     return sorted(sources, key=lambda source: (source.handover_date, source.kind, source.filename))
 
 
+def discover_ftp_handover_sources_since(ftp: ftplib.FTP, start: dt.date,
+                                        end: dt.date) -> list[HandoverSource]:
+    """Discover every handover dated in the inclusive monitoring window."""
+    if end < start:
+        return []
+    sources: dict[str, HandoverSource] = {}
+    cursor = dt.date(start.year, start.month, 1)
+    end_month = dt.date(end.year, end.month, 1)
+    while cursor <= end_month:
+        for source in discover_ftp_handover_sources(ftp, cursor.year, cursor.month):
+            if start <= source.handover_date <= end:
+                sources[source.identity] = source
+        cursor = (cursor.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+    return sorted(sources.values(), key=lambda source: (source.handover_date, source.kind, source.filename))
+
+
 def local_handover_sources(paths: list[Path]) -> list[HandoverSource]:
     sources: list[HandoverSource] = []
     for path in paths:
@@ -1080,8 +1099,257 @@ def _pending_ftp_sources(state: dict[str, dict]) -> list[HandoverSource]:
     return sources
 
 
+def _load_note_state(path: Path) -> dict:
+    if not path.exists():
+        return {
+            "version": 1,
+            "start_date": HANDOVER_MONITOR_START.isoformat(),
+            "matters": {},
+            "pending_batch": None,
+        }
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(state, dict) or not isinstance(state.get("matters"), dict):
+        raise ValueError(f"Invalid file-note processing state: {path}")
+    if state.get("start_date") != HANDOVER_MONITOR_START.isoformat():
+        raise ValueError(
+            f"File-note state start date must be {HANDOVER_MONITOR_START.isoformat()}: {path}"
+        )
+    return state
+
+
+def _note_record_id(note: dict, matter_id: str) -> str:
+    record_id = str(note.get("recordid") or "").strip()
+    if not record_id.isdecimal():
+        raise ValueError(f"Matter {matter_id}: matching file note has no numeric RecordID")
+    return record_id
+
+
+def _remote_csv_path(local_path: Path, mt_id: str) -> str:
+    return f"{FTP_WRITE_BACK_DIR.rstrip('/')}/{mt_id.removeprefix('MT')}/{local_path.name}"
+
+
+def _ftp_file_exists(ftp: ftplib.FTP, remote_path: str) -> bool:
+    remote_dir, filename = remote_path.rsplit("/", 1)
+    return filename in _ftp_names(ftp, remote_dir)
+
+
+def _register_handover_matters(ftp: ftplib.FTP, sources: list[HandoverSource],
+                               state: dict, args: argparse.Namespace, api_key: str) -> dict[str, int]:
+    matters = state["matters"]
+    counts = {"handover_files": len(sources), "accounts": 0, "registered": 0,
+              "pending": 0, "excluded": 0, "not_new": 0}
+    for source in sources:
+        local_path = download_handover_source(ftp, source, args.download_dir)
+        for account in read_handover_accounts(local_path):
+            counts["accounts"] += 1
+            if account.client_id is None or not account.reference:
+                counts["pending"] += 1
+                continue
+            matches = fetch_matters_by_reference(account.client_id, account.reference, api_key)
+            if not matches:
+                counts["pending"] += 1
+                print(f"Handover row {account.row_number}: matter not found yet", file=sys.stderr)
+                continue
+            matches = [matter for matter in matches if _is_new_handover_matter(matter, source.handover_date)]
+            if len(matches) != 1:
+                counts["pending" if len(matches) > 1 else "not_new"] += 1
+                continue
+            matter = matches[0]
+            instructed = _matter_instructed_date(matter)
+            if instructed is None or instructed < HANDOVER_MONITOR_START:
+                counts["not_new"] += 1
+                continue
+            if matter_eligibility_reasons(matter):
+                counts["excluded"] += 1
+                continue
+            matter_id = str(matter.get("recordid") or "").strip()
+            if not matter_id.isdecimal():
+                raise ValueError(f"Handover row {account.row_number}: matched matter has no RecordID")
+            previous = matters.get(matter_id, {})
+            source_ids = sorted(set(previous.get("handover_sources", [])) | {source.identity})
+            matters[matter_id] = {
+                "matter_id": matter_id,
+                "client_id": account.client_id,
+                "account_reference": account.reference,
+                "file_ref": str(matter.get("fileref") or ""),
+                "date_instructed": instructed.isoformat(),
+                "physical_city": account.physical_city,
+                "handover_date": source.handover_date.isoformat(),
+                "handover_sources": source_ids,
+                "sent_file_note_ids": sorted(set(previous.get("sent_file_note_ids", []))),
+            }
+            if not previous:
+                counts["registered"] += 1
+    return counts
+
+
+def _collect_unsent_file_notes(state: dict, api_key: str, stage_codes: set[str],
+                               mappings: dict[str, dict]) -> tuple[dict[str, list[dict[str, object]]],
+                                                                    dict[str, list[str]], dict[str, int]]:
+    rows_by_stage: dict[str, list[dict[str, object]]] = {}
+    note_ids_by_matter: dict[str, list[str]] = {}
+    counts = {"new_matters": 0, "file_notes": 0, "excluded": 0,
+              "not_new": 0, "pending": 0}
+    for matter_id, registration in sorted(state["matters"].items(), key=lambda item: int(item[0])):
+        matter = fetch_matter(matter_id, api_key)
+        instructed = _matter_instructed_date(matter)
+        if instructed is None or instructed < HANDOVER_MONITOR_START:
+            counts["not_new"] += 1
+            continue
+        if matter_eligibility_reasons(matter):
+            counts["excluded"] += 1
+            continue
+        counts["new_matters"] += 1
+        notes = matching_filenotes(fetch_filenotes(matter_id, api_key), matter_id, stage_codes)
+        sent = {str(value) for value in registration.get("sent_file_note_ids", [])}
+        unsent_by_id: dict[str, dict] = {}
+        for note in notes:
+            note_id = _note_record_id(note, matter_id)
+            if note_id not in sent:
+                unsent_by_id.setdefault(note_id, note)
+        unsent = list(unsent_by_id.values())
+        unsent.sort(key=lambda note: (str(note.get("date") or ""), str(note.get("time") or ""),
+                                      str(note.get("recordid") or "")))
+        if not unsent:
+            continue
+        needs_party = any(
+            str(note.get("stagecode") or "").strip().upper() in {"MT327", "MT397"}
+            for note in unsent
+        )
+        debtor_party = fetch_debtor_party(matter_id, api_key) if needs_party else None
+        if needs_party and debtor_party is None:
+            counts["pending"] += 1
+        for note in unsent:
+            note_id = _note_record_id(note, matter_id)
+            mt_id = str(note.get("stagecode") or "").strip().upper()
+            if mt_id in {"MT327", "MT397"} and debtor_party is None:
+                continue
+            enriched = add_message_data(
+                note, matter, mappings, debtor_party, registration.get("physical_city")
+            )
+            mt_id = enriched["message_data"]["mt_id"]
+            rows_by_stage.setdefault(mt_id, []).append(_stage_row(enriched, mappings))
+            note_ids_by_matter.setdefault(matter_id, []).append(note_id)
+            counts["file_notes"] += 1
+    return rows_by_stage, note_ids_by_matter, counts
+
+
+def _finish_pending_batch(ftp: ftplib.FTP, state: dict, state_path: Path) -> None:
+    batch = state.get("pending_batch")
+    if not isinstance(batch, dict):
+        return
+    uploads: list[dict[str, object]] = []
+    for item in batch["files"]:
+        local_path = Path(item["local_path"])
+        if not local_path.is_file():
+            raise RuntimeError(f"Pending write-back CSV is missing: {local_path}")
+        remote_path = item["remote_path"]
+        if not item.get("uploaded"):
+            if not _ftp_file_exists(ftp, remote_path):
+                uploaded_path = upload_csv_to_ftp(ftp, local_path, FTP_WRITE_BACK_DIR, item["mt_id"])
+                if uploaded_path != remote_path:
+                    raise RuntimeError(f"Unexpected FTP path for pending upload: {uploaded_path}")
+            item["uploaded"] = True
+            _save_state(state_path, state)
+        uploads.append({"mt_id": item["mt_id"], "rows": item["rows"], "remote_path": remote_path})
+    source = HandoverSource(
+        "daily-monitor", f"Handovers_from_{HANDOVER_MONITOR_START.strftime('%Y%m%d')}",
+        HANDOVER_MONITOR_START, "daily"
+    )
+    if not send_ftp_upload_summary_email(
+        source, batch["counts"], uploads, dt.datetime.now(ZoneInfo("Africa/Johannesburg"))
+    ):
+        raise RuntimeError("Write-back files uploaded, but the helpdesk summary email could not be sent")
+    for matter_id, note_ids in batch["note_ids_by_matter"].items():
+        registration = state["matters"][matter_id]
+        registration["sent_file_note_ids"] = sorted(
+            set(registration.get("sent_file_note_ids", [])) | set(note_ids), key=int
+        )
+    state["last_successful_run"] = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).isoformat()
+    state["pending_batch"] = None
+    _save_state(state_path, state)
+
+
+def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
+                                   stage_codes: set[str], mappings: dict[str, dict]) -> int:
+    """Monitor matters handed over since 6 October and export unseen FileNote IDs."""
+    state_path = args.csv_dir / NOTE_STATE_FILENAME
+    state = _load_note_state(state_path)
+    missing = [
+        name for name in ("FTP_HOST", "FTP_USER", "FTP_PASS")
+        if not os.getenv(name, "").strip()
+    ]
+    if missing:
+        raise ValueError(f"FTP settings missing: {', '.join(missing)}")
+    ftp = connect_ftp(args.ftp_timeout)
+    try:
+        if state.get("pending_batch"):
+            print("Resuming pending write-back delivery")
+            _finish_pending_batch(ftp, state, state_path)
+        today = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).date()
+        sources = discover_ftp_handover_sources_since(ftp, HANDOVER_MONITOR_START, today)
+        if args.latest_only:
+            sources = newest_sources(sources)
+        discovery = _register_handover_matters(ftp, sources, state, args, api_key)
+        rows_by_stage, note_ids_by_matter, counts = _collect_unsent_file_notes(
+            state, api_key, stage_codes, mappings
+        )
+        counts.update({
+            "accounts": discovery["accounts"],
+            "pending": counts["pending"] + discovery["pending"],
+            "excluded": counts["excluded"] + discovery["excluded"],
+            "not_new": counts["not_new"] + discovery["not_new"],
+            "stages_compared": len(rows_by_stage),
+            "stages_new": len(rows_by_stage),
+            "stages_skipped": 0,
+        })
+        state["last_checked_at"] = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).isoformat()
+        if not rows_by_stage:
+            _save_state(state_path, state)
+            print(
+                f"No new file notes; no CSV generated, no FTP upload, and no email sent | "
+                f"handover_files={discovery['handover_files']} registered_matters={len(state['matters'])}"
+            )
+            return 0
+        generated_at = dt.datetime.now(ZoneInfo("Africa/Johannesburg"))
+        csv_dir = args.csv_dir / generated_at.strftime("%Y-%m")
+        files = []
+        for mt_id, rows in sorted(rows_by_stage.items()):
+            csv_path = csv_dir / timestamped_csv_name(mt_id, mappings, generated_at)
+            write_csv(csv_path, rows, _stage_headers(mt_id, mappings))
+            files.append({
+                "mt_id": mt_id,
+                "rows": len(rows),
+                "local_path": str(csv_path.resolve()),
+                "remote_path": _remote_csv_path(csv_path, mt_id),
+                "uploaded": False,
+            })
+            print(f"CSV: {csv_path} | stage={mt_id} new_rows={len(rows)}")
+        state["pending_batch"] = {
+            "created_at": generated_at.isoformat(),
+            "files": files,
+            "note_ids_by_matter": note_ids_by_matter,
+            "counts": counts,
+        }
+        _save_state(state_path, state)
+        _finish_pending_batch(ftp, state, state_path)
+        print(
+            f"Incremental run complete | registered_matters={len(state['matters'])} "
+            f"new_file_notes={counts['file_notes']} stage_files={len(files)} pending={counts['pending']}"
+        )
+        return 0
+    finally:
+        try:
+            ftp.quit()
+        except ftplib.all_errors:
+            ftp.close()
+
+
 def run_handover_batch(args: argparse.Namespace, api_key: str, stage_codes: set[str],
                        mappings: dict[str, dict]) -> int:
+    if not args.handover_file and args.month == "previous":
+        return run_incremental_handover_batch(args, api_key, stage_codes, mappings)
+
     year, month = _month_to_scan(args.month)
     state_path = args.csv_dir / "processed_handover_files.json"
     state = _load_state(state_path)
@@ -1207,7 +1475,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stages-file", type=Path, default=DEFAULT_STAGES_FILE)
     parser.add_argument("--mappings-file", type=Path, default=DEFAULT_MAPPINGS_FILE)
     parser.add_argument("--output", type=Path, help="JSON output path in single-matter mode")
-    parser.add_argument("--month", default="previous", help="Handover month: previous (default), current, or YYYY-MM")
+    parser.add_argument(
+        "--month", default="previous",
+        help=("FTP mode: previous/default runs the incremental monitor from 2026-10-06; "
+              "current or YYYY-MM runs the legacy month backfill"),
+    )
     parser.add_argument("--handover-file", action="append", type=Path,
                         help="Use a local handover workbook instead of FTP; repeat for multiple files")
     parser.add_argument("--latest-only", action="store_true", help="Process only the newest dated file in each handover folder")

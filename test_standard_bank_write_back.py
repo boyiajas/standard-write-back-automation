@@ -527,5 +527,172 @@ class HandoverBatchTests(unittest.TestCase):
             self.assertTrue(next(iter(state.values()))["complete"])
 
 
+class IncrementalFileNoteTests(unittest.TestCase):
+    def _matter(self) -> dict:
+        return {
+            "recordid": "600001", "archivestatus": "0", "clientid": "150307",
+            "mattertypeid": "4", "theirref": "00012345678", "fileref": "STA387/0001",
+            "formatteddateinstructed": "06 Oct 2026",
+            "internalcomment": "Imported from handover file on 6 October 2026",
+        }
+
+    def _state(self) -> dict:
+        return {
+            "version": 1,
+            "start_date": "2026-10-06",
+            "matters": {
+                "600001": {
+                    "matter_id": "600001",
+                    "client_id": "150307",
+                    "account_reference": "00012345678",
+                    "file_ref": "STA387/0001",
+                    "date_instructed": "2026-10-06",
+                    "physical_city": "TEST CITY",
+                    "handover_date": "2026-10-06",
+                    "handover_sources": ["ftp:test.xlsx"],
+                    "sent_file_note_ids": ["700001"],
+                }
+            },
+            "pending_batch": None,
+        }
+
+    def test_monitor_discovery_includes_cutoff_and_filters_earlier_files(self) -> None:
+        october = [
+            write_back.HandoverSource("old", "old.xlsx", dt.date(2026, 10, 5), "panel_l"),
+            write_back.HandoverSource("cutoff", "cutoff.xlsx", dt.date(2026, 10, 6), "panel_l"),
+            write_back.HandoverSource("new", "new.xlsx", dt.date(2026, 10, 19), "panel_l"),
+        ]
+        november = [
+            write_back.HandoverSource("later", "later.xlsx", dt.date(2026, 11, 1), "panel_l"),
+        ]
+        with patch.object(
+            write_back, "discover_ftp_handover_sources", side_effect=[october, november]
+        ) as discover:
+            sources = write_back.discover_ftp_handover_sources_since(
+                object(), dt.date(2026, 10, 6), dt.date(2026, 11, 1)
+            )
+        self.assertEqual([source.identity for source in sources], ["cutoff", "new", "later"])
+        self.assertEqual(discover.call_count, 2)
+
+    def test_only_unsent_file_note_record_ids_are_exported(self) -> None:
+        notes = [
+            {"recordid": "700001", "matterid": "600001", "stagecode": "MT300",
+             "description": "ALREADY SENT", "formatteddatetime": "06 Oct 2026 09:00:00"},
+            {"recordid": "700002", "matterid": "600001", "stagecode": "MT300",
+             "description": "NEW NOTE", "formatteddatetime": "19 Oct 2026 10:30:00"},
+            {"recordid": "700002", "matterid": "600001", "stagecode": "MT300",
+             "description": "DUPLICATE API ROW", "formatteddatetime": "19 Oct 2026 10:30:00"},
+        ]
+        mappings, _ = write_back.load_message_mappings(write_back.DEFAULT_MAPPINGS_FILE)
+        with (
+            patch.object(write_back, "fetch_matter", return_value=self._matter()),
+            patch.object(write_back, "fetch_filenotes", return_value=notes),
+        ):
+            rows, note_ids, counts = write_back._collect_unsent_file_notes(
+                self._state(), "test-key", {"MT300"}, mappings
+            )
+        self.assertEqual(counts["file_notes"], 1)
+        self.assertEqual(note_ids, {"600001": ["700002"]})
+        self.assertEqual(len(rows["MT300"]), 1)
+        self.assertEqual(rows["MT300"][0]["messageID"], "300")
+
+    def test_no_unseen_notes_creates_no_csv_upload_or_email(self) -> None:
+        class FakeFTP:
+            def quit(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = write_back.argparse.Namespace(
+                csv_dir=root / "output", download_dir=root / "downloads", ftp_timeout=30,
+                latest_only=False,
+            )
+            discovery_counts = {
+                "handover_files": 1, "accounts": 1, "registered": 0,
+                "pending": 0, "excluded": 0, "not_new": 0,
+            }
+            with (
+                patch.dict(os.environ, {"FTP_HOST": "test", "FTP_USER": "test", "FTP_PASS": "test"}),
+                patch.object(write_back, "connect_ftp", return_value=FakeFTP()),
+                patch.object(write_back, "discover_ftp_handover_sources_since", return_value=[]),
+                patch.object(write_back, "_register_handover_matters", return_value=discovery_counts),
+                patch.object(
+                    write_back, "_collect_unsent_file_notes",
+                    return_value=({}, {}, {"new_matters": 1, "file_notes": 0, "excluded": 0,
+                                           "not_new": 0, "pending": 0}),
+                ),
+                patch.object(write_back, "write_csv") as write_csv,
+                patch.object(write_back, "upload_csv_to_ftp") as upload,
+                patch.object(write_back, "send_ftp_upload_summary_email") as email,
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    write_back.run_incremental_handover_batch(args, "test-key", {"MT300"}, {}), 0
+                )
+            write_csv.assert_not_called()
+            upload.assert_not_called()
+            email.assert_not_called()
+            self.assertTrue((args.csv_dir / write_back.NOTE_STATE_FILENAME).is_file())
+
+    def test_pending_delivery_commits_note_ids_after_upload_and_email(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "300_Acknowledgement_20261019_060000.csv"
+            csv_path.write_text("messageID\r\n300\r\n", encoding="utf-8")
+            state = self._state()
+            state["pending_batch"] = {
+                "created_at": "2026-10-19T06:00:00+02:00",
+                "files": [{
+                    "mt_id": "MT300", "rows": 1, "local_path": str(csv_path),
+                    "remote_path": write_back._remote_csv_path(csv_path, "MT300"),
+                    "uploaded": False,
+                }],
+                "note_ids_by_matter": {"600001": ["700002"]},
+                "counts": {"file_notes": 1},
+            }
+            state_path = root / write_back.NOTE_STATE_FILENAME
+            with (
+                patch.object(write_back, "_ftp_file_exists", return_value=False),
+                patch.object(
+                    write_back, "upload_csv_to_ftp",
+                    return_value=state["pending_batch"]["files"][0]["remote_path"],
+                ) as upload,
+                patch.object(write_back, "send_ftp_upload_summary_email", return_value=True) as email,
+            ):
+                write_back._finish_pending_batch(object(), state, state_path)
+            upload.assert_called_once()
+            email.assert_called_once()
+            self.assertIsNone(state["pending_batch"])
+            self.assertEqual(state["matters"]["600001"]["sent_file_note_ids"], ["700001", "700002"])
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIsNone(persisted["pending_batch"])
+
+    def test_email_failure_leaves_note_ids_pending_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "300_Acknowledgement_20261019_060000.csv"
+            csv_path.write_text("messageID\r\n300\r\n", encoding="utf-8")
+            state = self._state()
+            remote_path = write_back._remote_csv_path(csv_path, "MT300")
+            state["pending_batch"] = {
+                "created_at": "2026-10-19T06:00:00+02:00",
+                "files": [{"mt_id": "MT300", "rows": 1, "local_path": str(csv_path),
+                           "remote_path": remote_path, "uploaded": False}],
+                "note_ids_by_matter": {"600001": ["700002"]},
+                "counts": {"file_notes": 1},
+            }
+            state_path = root / write_back.NOTE_STATE_FILENAME
+            with (
+                patch.object(write_back, "_ftp_file_exists", return_value=False),
+                patch.object(write_back, "upload_csv_to_ftp", return_value=remote_path),
+                patch.object(write_back, "send_ftp_upload_summary_email", return_value=False),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "summary email"):
+                    write_back._finish_pending_batch(object(), state, state_path)
+            self.assertIsNotNone(state["pending_batch"])
+            self.assertTrue(state["pending_batch"]["files"][0]["uploaded"])
+            self.assertEqual(state["matters"]["600001"]["sent_file_note_ids"], ["700001"])
+
+
 if __name__ == "__main__":
     unittest.main()

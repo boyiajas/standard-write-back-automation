@@ -1,6 +1,6 @@
 # Standard Bank LegalSuite Write-Back Automation
 
-This document explains what `standard_bank_write_back.py` does, how it is configured, how it decides whether to upload a CSV, and how to run it manually or from cron.
+This document explains what `standard_bank_write_back.py` does, how it is configured, how it identifies a new file note, and how to run it manually or from cron.
 
 ## Purpose
 
@@ -55,20 +55,19 @@ The SMTP sender must be authorized to relay to those recipients. A Mimecast `451
 ## Normal workflow
 
 1. Load `.env`, stage definitions, and field mappings.
-2. Select the previous calendar month by default using Africa/Johannesburg time.
-3. List eligible Panel L and Debt Review handover workbooks on FTP.
-4. Download each workbook into the local `downloads_sbsa/` cache.
-5. Read client code and account/reference values.
-6. Find the matching LegalSuite matter by client and reference.
-7. Require the matter to be newly created from the matching handover and satisfy the configured eligibility rules.
-8. Retrieve matching file notes and group them by MT stage code.
-9. Enrich each row using the confirmed LegalSuite field sources and mapping workbook.
-10. For every MT ID, inspect the newest completed CSV already stored in that MT ID's FTP folder.
-11. Skip the MT ID if its current rows contain no new file-note rows and its headers are unchanged.
-12. Otherwise generate a timestamped CSV and upload it atomically through a temporary `.uploading` filename.
-13. Send the completion summary after uploads. State is marked complete only after the required workflow succeeds.
+2. Use Africa/Johannesburg time and list Panel L and Debt Review handovers dated from 6 October 2026 through today.
+3. Download each workbook into the local `downloads_sbsa/` cache.
+4. Read client code and account/reference values.
+5. Find the matching LegalSuite matter by client and reference.
+6. Require the matter to be newly created from the matching handover and satisfy the configured eligibility rules.
+7. Register the matter by storing its LegalSuite MatterID, FileRef, account reference, handover source, and physical city.
+8. Retrieve matching file notes and exclude each numeric `FileNote.RecordID` already in the sent ledger.
+9. Enrich the remaining rows using the confirmed LegalSuite field sources and mapping workbook, then group them by MT stage code.
+10. If every registered matter has no unseen note, create no CSV, upload nothing, and send no completion email.
+11. Otherwise generate one timestamped CSV per stage and upload it atomically through a temporary `.uploading` filename.
+12. Send the completion summary after uploads, then commit the delivered note IDs to state.
 
-The FTP comparison prevents the same file notes from being uploaded repeatedly on daily runs. A new MT ID, a new file note, or a header change is sufficient to trigger a new CSV upload.
+The numeric LegalSuite file-note RecordID prevents the same note from being uploaded repeatedly. Existing note edits are not treated as new notes. If upload or email delivery is interrupted, the pending batch stays in state and is completed before the next discovery pass.
 
 ## CSV format and naming
 
@@ -95,7 +94,7 @@ python3 standard_bank_write_back.py --handover-file /path/to/Standard_Bank_Panel
 python3 standard_bank_write_back.py 565398
 ```
 
-The positional MatterID command runs the original single-matter JSON mode. `--handover-file` is local-only and therefore does not perform the FTP previous-CSV comparison or upload. Use `--force` only when a completed source must be rebuilt.
+The positional MatterID command runs the original single-matter JSON mode. `--handover-file` is local-only. Explicit `--month current` and `--month YYYY-MM` commands run the legacy month backfill path, which retains its source and FTP row comparison behavior. Use `--force` only with that legacy flow when a completed source must be rebuilt.
 
 ## Verification
 
@@ -129,7 +128,8 @@ Before enabling the cron entry, run the same command manually and verify the gen
 
 - `downloads_sbsa/`: cached source handover workbooks; ignored by Git.
 - `output_sbsa/YYYY-MM/`: generated CSVs; ignored by Git.
-- `output_sbsa/processed_handover_files.json`: source hashes, completion state, generated paths, FTP paths, and pending counts; ignored by Git.
+- `output_sbsa/write_back_note_state.json`: registered matters, sent file-note IDs, and an interrupted delivery batch; ignored by Git.
+- `output_sbsa/processed_handover_files.json`: legacy local and explicit month backfill state; ignored by Git.
 - `.env`: private credentials; ignored by Git.
 
-If a matter is not found yet, the source remains pending and is retried on a later run. If email is rejected, FTP files may already exist but the source is intentionally not marked fully complete.
+If a matter is not found yet, handover discovery retries it on a later run. If email is rejected, FTP files may already exist, but their note IDs remain uncommitted. The next run checks for those exact remote filenames and resumes the same pending batch without uploading the same file again.
