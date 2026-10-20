@@ -39,6 +39,9 @@ EXPORT_FORMAT_VERSION = 13
 HANDOVER_MONITOR_START = dt.date(2026, 10, 6)
 NOTE_STATE_FILENAME = "write_back_note_state.json"
 FTP_WRITE_BACK_DIR = "/LSW TO APT/SBSA Panel Write Back Data"
+FTP_STATE_BACKUP_DIR = "/LSW TO APT/SBSA Write Back Feedback Files/Automation State"
+FTP_STATE_BACKUP_PREFIX = "standard_bank_write_back_state_"
+FTP_STATE_BACKUP_RETENTION = 100
 WRITE_BACK_REPORT_TO = (
     "helpdesk@iconis.co.za",
     "dev@iconis.co.za",
@@ -1099,22 +1102,94 @@ def _pending_ftp_sources(state: dict[str, dict]) -> list[HandoverSource]:
     return sources
 
 
-def _load_note_state(path: Path) -> dict:
-    if not path.exists():
-        return {
-            "version": 1,
-            "start_date": HANDOVER_MONITOR_START.isoformat(),
-            "matters": {},
-            "pending_batch": None,
-        }
-    state = json.loads(path.read_text(encoding="utf-8"))
+def _default_note_state() -> dict:
+    return {
+        "version": 1,
+        "start_date": HANDOVER_MONITOR_START.isoformat(),
+        "matters": {},
+        "pending_batch": None,
+    }
+
+
+def _validate_note_state(state: object, source: object) -> dict:
     if not isinstance(state, dict) or not isinstance(state.get("matters"), dict):
-        raise ValueError(f"Invalid file-note processing state: {path}")
+        raise ValueError(f"Invalid file-note processing state: {source}")
     if state.get("start_date") != HANDOVER_MONITOR_START.isoformat():
         raise ValueError(
-            f"File-note state start date must be {HANDOVER_MONITOR_START.isoformat()}: {path}"
+            f"File-note state start date must be {HANDOVER_MONITOR_START.isoformat()}: {source}"
         )
     return state
+
+
+def _load_note_state(path: Path) -> dict:
+    if not path.exists():
+        return _default_note_state()
+    return _validate_note_state(json.loads(path.read_text(encoding="utf-8")), path)
+
+
+def _ftp_state_backup_names(ftp: ftplib.FTP) -> list[str]:
+    pattern = re.compile(
+        rf"^{re.escape(FTP_STATE_BACKUP_PREFIX)}\d{{8}}_\d{{12}}\.json$"
+    )
+    return sorted(name for name in _ftp_names(ftp, FTP_STATE_BACKUP_DIR) if pattern.fullmatch(name))
+
+
+def backup_note_state_to_ftp(ftp: ftplib.FTP, state: dict) -> str:
+    """Atomically upload a timestamped state snapshot and retain recent history."""
+    ensure_ftp_directory(ftp, FTP_STATE_BACKUP_DIR)
+    timestamp = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).strftime("%Y%m%d_%H%M%S%f")
+    filename = f"{FTP_STATE_BACKUP_PREFIX}{timestamp}.json"
+    remote_path = f"{FTP_STATE_BACKUP_DIR}/{filename}"
+    temporary_remote_path = f"{remote_path}.uploading"
+    payload = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    ftp.storbinary(f"STOR {temporary_remote_path}", io.BytesIO(payload))
+    try:
+        ftp.rename(temporary_remote_path, remote_path)
+    except ftplib.all_errors:
+        try:
+            ftp.delete(temporary_remote_path)
+        except ftplib.all_errors:
+            pass
+        raise
+    backups = _ftp_state_backup_names(ftp)
+    for old_name in backups[:-FTP_STATE_BACKUP_RETENTION]:
+        try:
+            ftp.delete(f"{FTP_STATE_BACKUP_DIR}/{old_name}")
+        except ftplib.all_errors as exc:
+            print(f"Could not prune old FTP state backup {old_name}: {exc}", file=sys.stderr)
+    return remote_path
+
+
+def _restore_note_state_from_ftp(ftp: ftplib.FTP, path: Path) -> dict | None:
+    names = _ftp_state_backup_names(ftp)
+    if not names:
+        return None
+    errors: list[str] = []
+    for filename in reversed(names):
+        payload = bytearray()
+        remote_path = f"{FTP_STATE_BACKUP_DIR}/{filename}"
+        try:
+            ftp.retrbinary(f"RETR {remote_path}", payload.extend)
+            state = _validate_note_state(json.loads(payload.decode("utf-8")), remote_path)
+        except (ftplib.Error, OSError, EOFError, UnicodeError, ValueError) as exc:
+            errors.append(f"{filename}: {exc}")
+            continue
+        _save_state(path, state)
+        print(f"Restored file-note state from FTP: {remote_path}")
+        return state
+    raise ValueError("No valid FTP file-note state backup was found: " + "; ".join(errors))
+
+
+def _load_or_restore_note_state(ftp: ftplib.FTP, path: Path) -> dict:
+    if path.exists():
+        return _load_note_state(path)
+    restored = _restore_note_state_from_ftp(ftp, path)
+    return restored if restored is not None else _default_note_state()
+
+
+def _save_note_state(path: Path, state: dict, ftp: ftplib.FTP) -> str:
+    _save_state(path, state)
+    return backup_note_state_to_ftp(ftp, state)
 
 
 def _note_record_id(note: dict, matter_id: str) -> str:
@@ -1241,17 +1316,28 @@ def _finish_pending_batch(ftp: ftplib.FTP, state: dict, state_path: Path) -> Non
     uploads: list[dict[str, object]] = []
     for item in batch["files"]:
         local_path = Path(item["local_path"])
-        if not local_path.is_file():
-            raise RuntimeError(f"Pending write-back CSV is missing: {local_path}")
         remote_path = item["remote_path"]
+        if not _ftp_file_exists(ftp, remote_path):
+            if not local_path.is_file():
+                headers = item.get("headers")
+                rows = item.get("data")
+                if not isinstance(headers, list) or not isinstance(rows, list):
+                    raise RuntimeError(f"Pending write-back CSV is missing and cannot be rebuilt: {local_path}")
+                local_path = state_path.parent / "recovered_pending" / local_path.name
+                write_csv(local_path, rows, headers)
+                item["local_path"] = str(local_path.resolve())
+                print(f"Rebuilt pending write-back CSV from state backup: {local_path}")
+            uploaded_path = upload_csv_to_ftp(ftp, local_path, FTP_WRITE_BACK_DIR, item["mt_id"])
+            if uploaded_path != remote_path:
+                raise RuntimeError(f"Unexpected FTP path for pending upload: {uploaded_path}")
         if not item.get("uploaded"):
-            if not _ftp_file_exists(ftp, remote_path):
-                uploaded_path = upload_csv_to_ftp(ftp, local_path, FTP_WRITE_BACK_DIR, item["mt_id"])
-                if uploaded_path != remote_path:
-                    raise RuntimeError(f"Unexpected FTP path for pending upload: {uploaded_path}")
             item["uploaded"] = True
-            _save_state(state_path, state)
-        uploads.append({"mt_id": item["mt_id"], "rows": item["rows"], "remote_path": remote_path})
+            _save_note_state(state_path, state, ftp)
+        uploads.append({
+            "mt_id": item["mt_id"],
+            "rows": item.get("row_count", item.get("rows", 0)),
+            "remote_path": remote_path,
+        })
     source = HandoverSource(
         "daily-monitor", f"Handovers_from_{HANDOVER_MONITOR_START.strftime('%Y%m%d')}",
         HANDOVER_MONITOR_START, "daily"
@@ -1267,14 +1353,13 @@ def _finish_pending_batch(ftp: ftplib.FTP, state: dict, state_path: Path) -> Non
         )
     state["last_successful_run"] = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).isoformat()
     state["pending_batch"] = None
-    _save_state(state_path, state)
+    _save_note_state(state_path, state, ftp)
 
 
 def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
                                    stage_codes: set[str], mappings: dict[str, dict]) -> int:
     """Monitor matters handed over since 6 October and export unseen FileNote IDs."""
     state_path = args.csv_dir / NOTE_STATE_FILENAME
-    state = _load_note_state(state_path)
     missing = [
         name for name in ("FTP_HOST", "FTP_USER", "FTP_PASS")
         if not os.getenv(name, "").strip()
@@ -1283,6 +1368,7 @@ def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
         raise ValueError(f"FTP settings missing: {', '.join(missing)}")
     ftp = connect_ftp(args.ftp_timeout)
     try:
+        state = _load_or_restore_note_state(ftp, state_path)
         if state.get("pending_batch"):
             print("Resuming pending write-back delivery")
             _finish_pending_batch(ftp, state, state_path)
@@ -1291,6 +1377,7 @@ def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
         if args.latest_only:
             sources = newest_sources(sources)
         discovery = _register_handover_matters(ftp, sources, state, args, api_key)
+        _save_note_state(state_path, state, ftp)
         rows_by_stage, note_ids_by_matter, counts = _collect_unsent_file_notes(
             state, api_key, stage_codes, mappings
         )
@@ -1305,7 +1392,7 @@ def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
         })
         state["last_checked_at"] = dt.datetime.now(ZoneInfo("Africa/Johannesburg")).isoformat()
         if not rows_by_stage:
-            _save_state(state_path, state)
+            _save_note_state(state_path, state, ftp)
             print(
                 f"No new file notes; no CSV generated, no FTP upload, and no email sent | "
                 f"handover_files={discovery['handover_files']} registered_matters={len(state['matters'])}"
@@ -1316,10 +1403,13 @@ def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
         files = []
         for mt_id, rows in sorted(rows_by_stage.items()):
             csv_path = csv_dir / timestamped_csv_name(mt_id, mappings, generated_at)
-            write_csv(csv_path, rows, _stage_headers(mt_id, mappings))
+            headers = _stage_headers(mt_id, mappings)
+            write_csv(csv_path, rows, headers)
             files.append({
                 "mt_id": mt_id,
-                "rows": len(rows),
+                "row_count": len(rows),
+                "headers": headers,
+                "data": rows,
                 "local_path": str(csv_path.resolve()),
                 "remote_path": _remote_csv_path(csv_path, mt_id),
                 "uploaded": False,
@@ -1331,7 +1421,7 @@ def run_incremental_handover_batch(args: argparse.Namespace, api_key: str,
             "note_ids_by_matter": note_ids_by_matter,
             "counts": counts,
         }
-        _save_state(state_path, state)
+        _save_note_state(state_path, state, ftp)
         _finish_pending_batch(ftp, state, state_path)
         print(
             f"Incremental run complete | registered_matters={len(state['matters'])} "

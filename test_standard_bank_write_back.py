@@ -596,6 +596,42 @@ class IncrementalFileNoteTests(unittest.TestCase):
         self.assertEqual(len(rows["MT300"]), 1)
         self.assertEqual(rows["MT300"][0]["messageID"], "300")
 
+    def test_state_backup_can_restore_a_missing_local_ledger(self) -> None:
+        class MemoryFTP:
+            def __init__(self):
+                self.files = {}
+
+            def storbinary(self, command, handle):
+                self.files[command.removeprefix("STOR ")] = handle.read()
+
+            def rename(self, source, destination):
+                self.files[destination] = self.files.pop(source)
+
+            def nlst(self, directory):
+                return [path for path in self.files if path.startswith(directory.rstrip("/") + "/")]
+
+            def retrbinary(self, command, callback):
+                callback(self.files[command.removeprefix("RETR ")])
+
+            def delete(self, path):
+                self.files.pop(path, None)
+
+        ftp = MemoryFTP()
+        state = self._state()
+        with patch.object(write_back, "ensure_ftp_directory"):
+            remote_path = write_back.backup_note_state_to_ftp(ftp, state)
+        self.assertTrue(remote_path.startswith(
+            write_back.FTP_STATE_BACKUP_DIR + "/" + write_back.FTP_STATE_BACKUP_PREFIX
+        ))
+        self.assertTrue(remote_path.endswith(".json"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            local_path = Path(directory) / write_back.NOTE_STATE_FILENAME
+            with redirect_stdout(io.StringIO()):
+                restored = write_back._restore_note_state_from_ftp(ftp, local_path)
+            self.assertEqual(restored, state)
+            self.assertEqual(json.loads(local_path.read_text(encoding="utf-8")), state)
+
     def test_no_unseen_notes_creates_no_csv_upload_or_email(self) -> None:
         class FakeFTP:
             def quit(self):
@@ -614,6 +650,12 @@ class IncrementalFileNoteTests(unittest.TestCase):
             with (
                 patch.dict(os.environ, {"FTP_HOST": "test", "FTP_USER": "test", "FTP_PASS": "test"}),
                 patch.object(write_back, "connect_ftp", return_value=FakeFTP()),
+                patch.object(write_back, "_load_or_restore_note_state",
+                             return_value=write_back._default_note_state()),
+                patch.object(
+                    write_back, "backup_note_state_to_ftp",
+                    return_value="/backup/standard_bank_write_back_state_test.json",
+                ),
                 patch.object(write_back, "discover_ftp_handover_sources_since", return_value=[]),
                 patch.object(write_back, "_register_handover_matters", return_value=discovery_counts),
                 patch.object(
@@ -658,6 +700,8 @@ class IncrementalFileNoteTests(unittest.TestCase):
                     return_value=state["pending_batch"]["files"][0]["remote_path"],
                 ) as upload,
                 patch.object(write_back, "send_ftp_upload_summary_email", return_value=True) as email,
+                patch.object(write_back, "backup_note_state_to_ftp",
+                             return_value="/backup/standard_bank_write_back_state_test.json"),
             ):
                 write_back._finish_pending_batch(object(), state, state_path)
             upload.assert_called_once()
@@ -666,6 +710,40 @@ class IncrementalFileNoteTests(unittest.TestCase):
             self.assertEqual(state["matters"]["600001"]["sent_file_note_ids"], ["700001", "700002"])
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertIsNone(persisted["pending_batch"])
+
+    def test_pending_csv_is_rebuilt_after_local_box_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing_path = root / "lost" / "300_Acknowledgement_20261019_060000.csv"
+            state = self._state()
+            remote_path = write_back._remote_csv_path(missing_path, "MT300")
+            state["pending_batch"] = {
+                "created_at": "2026-10-19T06:00:00+02:00",
+                "files": [{
+                    "mt_id": "MT300", "row_count": 1,
+                    "headers": ["messageID", "Acccount Number"],
+                    "data": [{"messageID": "300", "Acccount Number": "00012345678"}],
+                    "local_path": str(missing_path), "remote_path": remote_path,
+                    "uploaded": False,
+                }],
+                "note_ids_by_matter": {"600001": ["700002"]},
+                "counts": {"file_notes": 1},
+            }
+            state_path = root / write_back.NOTE_STATE_FILENAME
+            with (
+                patch.object(write_back, "_ftp_file_exists", return_value=False),
+                patch.object(write_back, "upload_csv_to_ftp", return_value=remote_path) as upload,
+                patch.object(write_back, "send_ftp_upload_summary_email", return_value=True),
+                patch.object(write_back, "backup_note_state_to_ftp",
+                             return_value="/backup/standard_bank_write_back_state_test.json"),
+                redirect_stdout(io.StringIO()),
+            ):
+                write_back._finish_pending_batch(object(), state, state_path)
+            rebuilt_path = upload.call_args.args[1]
+            self.assertTrue(rebuilt_path.is_file())
+            with rebuilt_path.open(encoding="utf-8", newline="") as handle:
+                self.assertEqual(list(csv.DictReader(handle))[0]["Acccount Number"], "00012345678")
+            self.assertIsNone(state["pending_batch"])
 
     def test_email_failure_leaves_note_ids_pending_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -686,6 +764,8 @@ class IncrementalFileNoteTests(unittest.TestCase):
                 patch.object(write_back, "_ftp_file_exists", return_value=False),
                 patch.object(write_back, "upload_csv_to_ftp", return_value=remote_path),
                 patch.object(write_back, "send_ftp_upload_summary_email", return_value=False),
+                patch.object(write_back, "backup_note_state_to_ftp",
+                             return_value="/backup/standard_bank_write_back_state_test.json"),
             ):
                 with self.assertRaisesRegex(RuntimeError, "summary email"):
                     write_back._finish_pending_batch(object(), state, state_path)

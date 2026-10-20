@@ -45,6 +45,12 @@ The write-back directory is fixed in the script as:
 
 Each MT ID is stored in its numeric subfolder, for example `.../321/`.
 
+Incremental state snapshots are stored separately under:
+
+`/LSW TO APT/SBSA Write Back Feedback Files/Automation State/`
+
+They use timestamped names such as `standard_bank_write_back_state_20261020_060000000000.json`.
+
 Completion and failure messages are sent to:
 
 - `helpdesk@iconis.co.za`
@@ -66,8 +72,9 @@ The SMTP sender must be authorized to relay to those recipients. A Mimecast `451
 10. If every registered matter has no unseen note, create no CSV, upload nothing, and send no completion email.
 11. Otherwise generate one timestamped CSV per stage and upload it atomically through a temporary `.uploading` filename.
 12. Send the completion summary after uploads, then commit the delivered note IDs to state.
+13. Save each state transition locally and as an atomic timestamped FTP snapshot. Retain the newest 100 snapshots.
 
-The numeric LegalSuite file-note RecordID prevents the same note from being uploaded repeatedly. Existing note edits are not treated as new notes. If upload or email delivery is interrupted, the pending batch stays in state and is completed before the next discovery pass.
+The numeric LegalSuite file-note RecordID prevents the same note from being uploaded repeatedly. Existing note edits are not treated as new notes. If the local state is missing, the newest valid FTP snapshot is restored before handover discovery. If upload or email delivery is interrupted, the pending batch stays in state and is completed before the next discovery pass. Pending snapshots contain the CSV headers and rows needed to rebuild a missing local pending file after box loss.
 
 ## CSV format and naming
 
@@ -129,6 +136,7 @@ Before enabling the cron entry, run the same command manually and verify the gen
 - `downloads_sbsa/`: cached source handover workbooks; ignored by Git.
 - `output_sbsa/YYYY-MM/`: generated CSVs; ignored by Git.
 - `output_sbsa/write_back_note_state.json`: registered matters, sent file-note IDs, and an interrupted delivery batch; ignored by Git.
+- `/LSW TO APT/SBSA Write Back Feedback Files/Automation State/standard_bank_write_back_state_*.json`: remote recovery snapshots; newest 100 retained.
 - `output_sbsa/processed_handover_files.json`: legacy local and explicit month backfill state; ignored by Git.
 - `.env`: private credentials; ignored by Git.
 
