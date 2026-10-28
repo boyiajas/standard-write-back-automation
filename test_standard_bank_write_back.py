@@ -205,18 +205,18 @@ class HandoverBatchTests(unittest.TestCase):
             with csv_path.open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
-            self.assertEqual(list(rows[0]), [*write_back.BANK_ENVELOPE_HEADERS, "Acccount Number"])
+            self.assertEqual(
+                list(rows[0]),
+                [*write_back.BANK_ENVELOPE_HEADERS, "Account Number", "CACS Supplier"],
+            )
             self.assertEqual(rows[0]["suite"], "316")
             self.assertEqual(rows[0]["messageID"], "300")
             self.assertEqual(rows[0]["date"], "20260814")
-            self.assertEqual(rows[0]["Acccount Number"], "00012345678")
-            unmapped_path = next(csv_dir.glob("326_Write_Back_*.csv"))
-            with unmapped_path.open(encoding="utf-8-sig", newline="") as handle:
-                unmapped_rows = list(csv.DictReader(handle))
-            self.assertEqual(list(unmapped_rows[0]), [*write_back.BANK_ENVELOPE_HEADERS, "Acccount Number"])
-            self.assertEqual(unmapped_rows[0]["messageID"], "326")
+            self.assertEqual(rows[0]["Account Number"], "00012345678")
+            self.assertEqual(rows[0]["CACS Supplier"], "")
+            self.assertEqual(list(csv_dir.glob("326_*.csv")), [])
             state = json.loads((output_dir / "processed_handover_files.json").read_text())
-            self.assertEqual(len(next(iter(state.values()))["csv_paths"]), 2)
+            self.assertEqual(len(next(iter(state.values()))["csv_paths"]), 1)
 
     def test_timestamped_filename_and_mt_folder_ftp_upload(self) -> None:
         generated_at = dt.datetime(2026, 10, 1, 6, 7, 8, tzinfo=dt.timezone.utc)
@@ -335,7 +335,7 @@ class HandoverBatchTests(unittest.TestCase):
     def test_stage_headers_include_only_mapped_fields_and_disambiguate_duplicates(self) -> None:
         mappings, _ = write_back.load_message_mappings(write_back.DEFAULT_MAPPINGS_FILE)
         self.assertEqual(write_back._stage_headers("MT300", mappings),
-                         [*write_back.BANK_ENVELOPE_HEADERS, "Acccount Number"])
+                         [*write_back.BANK_ENVELOPE_HEADERS, "Account Number", "CACS Supplier"])
         headers = write_back._stage_headers("MT304", mappings)
         self.assertIn("Fee Amount [K]", headers)
         self.assertIn("Fee Amount [M]", headers)
@@ -346,7 +346,41 @@ class HandoverBatchTests(unittest.TestCase):
         mappings, _ = write_back.load_message_mappings(write_back.DEFAULT_MAPPINGS_FILE)
         with Path("321_Defended_Matter_20260731.csv").open(encoding="utf-8-sig", newline="") as handle:
             sample_headers = next(csv.reader(handle))
-        self.assertEqual(write_back._stage_headers("MT321", mappings), sample_headers)
+        self.assertEqual(write_back._stage_headers("MT321", mappings), [*sample_headers, "CACS Supplier"])
+
+    def test_reviewed_mapping_ids_and_field_corrections(self) -> None:
+        mappings, warnings = write_back.load_message_mappings(write_back.DEFAULT_MAPPINGS_FILE)
+        self.assertEqual(warnings, [])
+        self.assertEqual(set(mappings), {
+            "MT300", "MT303", "MT304", "MT321", "MT327", "MT328", "MT329",
+            "MT334", "MT335", "MT336", "MT347", "MT348", "MT349", "MT350",
+            "MT351", "MT354", "MT355", "MT397", "MT405", "MT409", "MT415",
+            "MT416", "MT421", "MT428", "MT430",
+        })
+        rejected = {"MT502", "MT330", "MT326", "MT356", "MT386", "MT387", "MT500"}
+        self.assertTrue(rejected.isdisjoint(mappings))
+        self.assertTrue(all(write_back._stage_headers(mt_id, mappings)[-1] == "CACS Supplier"
+                            for mt_id in mappings))
+
+        matter = {
+            **self._matter(),
+            "theirref": "'00123456789",
+            "magcourtheldat": "DURBAN MAGISTRATES COURT",
+            "magcourtdistrict": "DURBAN",
+        }
+        mt303 = write_back.add_message_data(
+            {**self._note(), "stagecode": "MT303"}, matter, mappings
+        )
+        mt303_fields = {field["column"]: field for field in mt303["message_data"]["fields"]}
+        self.assertEqual(mt303_fields["F"]["value"], "L")
+
+        mt334 = write_back.add_message_data(
+            {**self._note(), "stagecode": "MT334"}, matter, mappings
+        )
+        mt334_row = write_back._stage_row(mt334, mappings)
+        self.assertEqual(mt334_row["Court Name / Place"], "DURBAN MAGISTRATES COURT")
+        self.assertEqual(mt334_row["Account Number"], "00123456789")
+        self.assertEqual(mt334_row["CACS Supplier"], "")
 
     def test_csv_uses_sample_compatible_utf8_without_bom(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -384,10 +418,13 @@ class HandoverBatchTests(unittest.TestCase):
 
     def test_text_field_uses_file_note_description(self) -> None:
         mappings, _ = write_back.load_message_mappings(write_back.DEFAULT_MAPPINGS_FILE)
-        note = {**self._note(), "stagecode": "MT355", "description": "EVENT DESCRIPTION"}
+        note = {
+            **self._note(), "stagecode": "MT355",
+            "description": "  EVENT   DESCRIPTION\r\n\r\nSecond   line  ",
+        }
         enriched = write_back.add_message_data(note, self._matter(), mappings)
         fields = {field["name"]: field for field in enriched["message_data"]["fields"]}
-        self.assertEqual(fields["Text"]["value"], "EVENT DESCRIPTION")
+        self.assertEqual(fields["Text"]["value"], "EVENT DESCRIPTION Second line")
         self.assertEqual(fields["Text"]["source"], "FileNote.Description")
 
     def test_mt329_each_note_uses_its_own_description_for_both_fields(self) -> None:

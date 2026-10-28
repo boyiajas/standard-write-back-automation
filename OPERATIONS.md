@@ -60,7 +60,7 @@ The SMTP sender must be authorized to relay to those recipients. A Mimecast `451
 
 ## Normal workflow
 
-1. Load `.env`, stage definitions, and field mappings.
+1. Load `.env`, stage definitions, and the approved Message ID mappings. Only IDs present in both workbooks are eligible for output.
 2. Use Africa/Johannesburg time and list Panel L and Debt Review handovers dated from 6 October 2026 through today.
 3. Download each workbook into the local `downloads_sbsa/` cache.
 4. Read client code and account/reference values.
@@ -86,7 +86,7 @@ For example:
 
 `321_Defended_Matter_20261008_060000.csv`
 
-The bank envelope begins with `suite, lawRef, messageID, sender, senderUser, recipient, date, dateTime`; `suite` is `316` and `messageID` is the numeric MT ID. MT321 follows the supplied sample layout exactly, including the legacy `Acccount Number` header. CSVs are plain UTF-8 with CRLF records.
+The bank envelope begins with `suite, lawRef, messageID, sender, senderUser, recipient, date, dateTime`; `suite` is `316` and `messageID` is the numeric MT ID. Every file ends with a blank `CACS Supplier` field for Traq. MT321 retains the supplied sample fields and legacy `Acccount Number` spelling before that new field. Other stages use `Account Number`. MT303 always uses `L` for PTP type, MT334 takes its place from the matter court fields, and MT355 Text is reduced to single spacing on one line. CSVs are plain UTF-8 with CRLF records.
 
 ## Manual commands
 

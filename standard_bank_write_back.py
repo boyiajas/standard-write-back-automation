@@ -35,7 +35,7 @@ DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / "SBSA Panel L LegalSuite
 DEFAULT_MAPPINGS_FILE = Path(__file__).resolve().parent / "SD-E4 Message ID Mappings.xlsx"
 DEFAULT_DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads_sbsa"
 DEFAULT_CSV_DIR = Path(__file__).resolve().parent / "output_sbsa"
-EXPORT_FORMAT_VERSION = 13
+EXPORT_FORMAT_VERSION = 14
 HANDOVER_MONITOR_START = dt.date(2026, 10, 6)
 NOTE_STATE_FILENAME = "write_back_note_state.json"
 FTP_WRITE_BACK_DIR = "/LSW TO APT/SBSA Panel Write Back Data"
@@ -47,6 +47,7 @@ WRITE_BACK_REPORT_TO = (
     "dev@iconis.co.za",
 )
 BANK_SUITE_CODE = "316"
+CACS_SUPPLIER_HEADER = "CACS Supplier"
 BANK_ENVELOPE_HEADERS = (
     "suite", "lawRef", "messageID", "sender", "senderUser", "recipient", "date", "dateTime",
 )
@@ -463,6 +464,17 @@ def _field_value(field: dict, mt_id: str, matter: dict, note: dict,
                 party, parlang, f"physicalline{address_line}", prefer_parlang=True
             )
     name = field["name"].strip().casefold()
+    if mt_id == "MT303" and field["column"] == "F" and name == "ptptype":
+        return "L", "Standard Bank business rule"
+    if mt_id == "MT334" and field["column"] == "H" and name == "court name / place":
+        for key, source in (
+            ("magcourtheldat", "Matter.MagCourtHeldAt"),
+            ("magcourtdistrict", "Matter.MagCourtDistrict"),
+        ):
+            value = matter.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip(), source
+        return None, None
     if mt_id == "MT329" and (
         (field["column"] == "E" and name == "description 1")
         or (field["column"] == "F" and name == "description2")
@@ -480,13 +492,15 @@ def _field_value(field: dict, mt_id: str, matter: dict, note: dict,
     if name == "datetime":
         return (timestamp.strftime("%Y%m%d%H%M%S"), "FileNote.Date/Time") if timestamp else (None, None)
     if name == "account number":
-        value = matter.get("theirref")
+        value = normalize_reference(matter.get("theirref"))
         return (value, "Matter.TheirRef") if value else (None, None)
     if name == "case number":
         value = matter.get("casenumber")
         return (value, "Matter.CaseNumber") if value else (None, None)
     if name == "text":
         value = note.get("description")
+        if mt_id == "MT355" and value is not None:
+            value = re.sub(r"\s+", " ", str(value)).strip()
         return (value, "FileNote.Description") if value else (None, None)
     return None, None
 
@@ -729,7 +743,7 @@ def _stage_headers(mt_id: str, mappings: dict[str, dict]) -> list[str]:
     """Return the Standard Bank envelope and ordered MT-specific fields."""
     mapping = mappings.get(mt_id)
     if mapping is None:
-        return [*BANK_ENVELOPE_HEADERS, "Acccount Number"]
+        return [*BANK_ENVELOPE_HEADERS, "Account Number", CACS_SUPPLIER_HEADER]
     fields = [
         field for field in mapping["fields"]
         if field["column"] not in {"C", "D"}
@@ -742,16 +756,14 @@ def _stage_headers(mt_id: str, mappings: dict[str, dict]) -> list[str]:
                 f"{mt_id} bank header template has {len(override)} fields; "
                 f"the mapping workbook requires {len(fields)}"
             )
-        return [*BANK_ENVELOPE_HEADERS, *override]
+        return [*BANK_ENVELOPE_HEADERS, *override, CACS_SUPPLIER_HEADER]
     names = [field["name"] for field in fields]
     duplicates = {name for name in names if names.count(name) > 1}
     headers = list(BANK_ENVELOPE_HEADERS)
     for field in fields:
         name = field["name"]
-        if name == "Account Number":
-            headers.append("Acccount Number")
-        else:
-            headers.append("{} [{}]".format(name, field["column"]) if name in duplicates else name)
+        headers.append("{} [{}]".format(name, field["column"]) if name in duplicates else name)
+    headers.append(CACS_SUPPLIER_HEADER)
     return headers
 
 def _stage_row(note: dict, mappings: dict[str, dict]) -> dict[str, object]:
@@ -761,12 +773,13 @@ def _stage_row(note: dict, mappings: dict[str, dict]) -> dict[str, object]:
     envelope = [BANK_SUITE_CODE, "", mt_id.removeprefix("MT"), "", "", "",
                 message["date"], message["datetime"]]
     if mt_id not in mappings:
-        values = [message["account_number"]]
+        values = [message["account_number"], ""]
     else:
         values = [
             field["value"] for field in message["fields"]
             if field["column"] not in {"C", "D"}
         ]
+        values.append("")
     return dict(zip(headers, [*envelope, *values]))
 
 
@@ -1613,8 +1626,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("LEGALSUITE_API_KEY is required in the environment or .env file")
 
     try:
-        stage_codes = load_stage_codes(args.stages_file)
+        configured_stage_codes = load_stage_codes(args.stages_file)
         mappings, mapping_warnings = load_message_mappings(args.mappings_file)
+        unsupported_stage_codes = configured_stage_codes - mappings.keys()
+        stage_codes = configured_stage_codes & mappings.keys()
+        if not stage_codes:
+            raise ValueError("The stages and message mapping workbooks have no Message IDs in common")
         if args.matter_id is None:
             return run_handover_batch(args, api_key, stage_codes, mappings)
         matter = fetch_matter(args.matter_id, api_key)
@@ -1631,7 +1648,7 @@ def main(argv: list[str] | None = None) -> int:
             "matter_eligibility": {"eligible": not exclusion_reasons, "reasons": exclusion_reasons},
             "matching_count": len(data),
             "mapping_warnings": mapping_warnings,
-            "unmapped_stage_codes": sorted(stage_codes - mappings.keys()),
+            "unmapped_stage_codes": sorted(unsupported_stage_codes),
             "data": data,
         }
         formatted = json.dumps(result, indent=2, ensure_ascii=False) + "\n"
